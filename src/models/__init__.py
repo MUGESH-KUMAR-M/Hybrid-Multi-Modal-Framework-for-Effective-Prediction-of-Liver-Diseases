@@ -1,0 +1,1 @@
+"""Model components: encoders, fusion, heads, and the full CMCHT-XAI model."""

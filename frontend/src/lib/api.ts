@@ -1,0 +1,20 @@
+import type { AnalyzeResponse, PatientsResponse } from "./types";
+
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+async function fetchJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${path}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export function getPatients() {
+  return fetchJson<PatientsResponse>("/api/patients");
+}
+
+export function analyzePatient(id: number) {
+  return fetchJson<AnalyzeResponse>(`/api/analyze/${id}`);
+}

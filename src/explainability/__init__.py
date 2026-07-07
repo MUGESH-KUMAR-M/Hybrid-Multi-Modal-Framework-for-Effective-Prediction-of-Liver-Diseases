@@ -1,0 +1,1 @@
+"""Explainability layer: SHAP, Grad-CAM, DiCE counterfactuals, MC-Dropout uncertainty."""

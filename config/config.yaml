@@ -1,0 +1,234 @@
+# ==============================================================================
+# CMCHT-XAI Configuration
+# Cross-Modal Contrastive Hybrid Transformer with Counterfactual Explainable AI
+# ==============================================================================
+# Every hyperparameter lives here. Ablation toggles (fusion_type / head_type /
+# use_cgct) drive the five-row ablation plan in Section 10 of the framework doc.
+# ==============================================================================
+
+seed: 42
+
+# ------------------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------------------
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  # Tabular clinical features (order matters for tokenization & SHAP)
+  tabular_features:
+    - Drug
+    - Age
+    - Sex
+    - Ascites
+    - Hepatomegaly
+    - Spiders
+    - Edema
+    - Bilirubin
+    - Cholesterol
+    - Albumin
+    - Copper
+    - Alk_Phos
+    - SGOT
+    - Tryglicerides
+    - Platelets
+    - Prothrombin
+  num_tabular_features: 16
+  # Imaging
+  image_size: 224
+  image_channels: 3        # CT/MRI resliced to 3-channel for Swin/Timm
+  # Splits
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  # NAFLD paired multimodal dataset features
+  nafld_tabular_features:
+    - Age
+    - "Gender(Female=1,Male=2)"
+    - BMI
+    - Waist_cm
+    - ALT
+    - AST
+    - Glucose
+    - Cholesterol
+    - LDL
+    - HDL
+    - Triglycerides
+  num_nafld_features: 11
+  # Primary dataset selection: nafld (paired multimodal) or cirrhosis (tabular-only)
+  primary_dataset: nafld
+  # Tabular preprocessing
+  impute_strategy: median
+  normalize: standard      # standard | minmax
+  apply_smote: true
+  # Pairing strategy when direct multimodal pairing is unavailable
+  pairing_strategy: disease_category_stratified
+
+# ------------------------------------------------------------------------------
+# Model architecture
+# ------------------------------------------------------------------------------
+model:
+  # Imaging encoder
+  imaging_encoder:
+    backbone: swin_cnn_hybrid   # swin_cnn_hybrid | resnet
+    swin_name: swin_tiny_patch4_window7_224
+    cnn_stem: resnet34
+    pretrained: true            # ImageNet init; overwritten by SimCLR weights if present
+    simclr_weights: checkpoints/simclr_encoder.pth
+    embed_dim: 256              # projected output dim
+  # Tabular encoder (FT-Transformer)
+  tabular_encoder:
+    type: ft_transformer
+    d_token: 64
+    n_blocks: 3
+    n_heads: 4
+    ffn_d_factor: 2
+    attention_dropout: 0.2
+    ffn_dropout: 0.1
+    residual_dropout: 0.0
+    embed_dim: 256
+  # Fusion
+  fusion:
+    # ABLATION TOGGLE: cross_attention (baseline) | csg (Contribution 1)
+    fusion_type: csg
+    embed_dim: 256
+    n_heads: 8
+    dropout: 0.1
+    # CSG-Fusion specific
+    csg:
+      probe_epsilon: 0.1        # tabular perturbation magnitude
+      probe_features: [Bilirubin, Albumin, SGOT]  # clinically meaningful
+      sensitivity_dim: 64
+      mc_passes_fusion: 3       # stochastic passes for fusion uncertainty
+      consistency_loss_weight: 0.1
+  # Heads
+  heads:
+    # ABLATION TOGGLE: independent (baseline) | cusp_cascade (Contribution 2)
+    head_type: cusp_cascade
+    embed_dim: 256
+    # Detection (binary)
+    detection:
+      hidden_dim: 128
+      dropout: 0.3
+    # Staging (multi-class: 0=stage1, 1=stage2, 2=stage3, 3=stage4)
+    staging:
+      num_classes: 4
+      hidden_dim: 128
+      dropout: 0.3
+    # Severity (MELD regression)
+    severity:
+      hidden_dim: 128
+      dropout: 0.3
+    # CUSP-Cascade specific
+    cusp:
+      mc_passes_train: 3        # averaged stochastic passes during training
+      mc_passes_eval: 10        # inference-time uncertainty passes
+      propagate_uncertainty: true
+      propagate_sensitivity: true
+
+# ------------------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------------------
+training:
+  # ABLATION TOGGLE: use_cgct (Contribution 3) on/off
+  use_cgct: true
+  epochs: 5
+  batch_size: 32
+  num_workers: 0
+  # Optimizer
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  # Scheduler
+  scheduler: cosine_annealing
+  warmup_epochs: 3
+  # Loss weights (gradient blending)
+  lambda_detection: 1.0
+  lambda_staging: 1.0
+  lambda_severity: 0.5
+  lambda_consistency: 0.1      # CSG counterfactual consistency loss
+  # CGCT schedule
+  cgct:
+    initial_teacher_forcing: 1.0   # start fully on ground truth
+    final_teacher_forcing: 0.2     # decay floor
+    uncertainty_threshold: 0.15    # above this -> trust ground truth
+  # Regularization
+  dropout: 0.3
+  label_smoothing: 0.1
+  mixup_alpha: 0.0               # 0 disables mixup on imaging
+  grad_clip: 1.0
+  # Uncertainty flagging at inference
+  uncertainty_threshold: 0.15
+
+# ------------------------------------------------------------------------------
+# SimCLR pre-training (Phase 2)
+# ------------------------------------------------------------------------------
+pretrain:
+  simclr:
+    encoder: swin_cnn_hybrid
+    proj_dim: 128
+    temperature: 0.5
+    epochs: 3
+    batch_size: 16
+    lr: 3.0e-4
+    weight_decay: 1.0e-6
+    # Augmentations
+    jitter_strength: 0.4
+    blur_sigma: [0.1, 2.0]
+
+# ------------------------------------------------------------------------------
+# Explainability (Phase 4)
+# ------------------------------------------------------------------------------
+explainability:
+  shap:
+    background_samples: 100
+  gradcam:
+    target_layer: imaging_encoder.backbone
+  counterfactual:
+    method: dice                 # dice | alibi
+    num_cf: 3
+    features_to_vary: all
+  uncertainty:
+    mc_passes: 10
+    threshold: 0.15
+
+# ------------------------------------------------------------------------------
+# Evaluation & ablation (Phase 5)
+# ------------------------------------------------------------------------------
+evaluation:
+  metrics:
+    detection: [accuracy, auc_roc, sensitivity, specificity, f1]
+    staging: [f1_macro, cohen_kappa, accuracy]
+    severity: [mae, rmse]
+    uncertainty: [ece]           # expected calibration error
+  ablation_configs:
+    - name: baseline
+      fusion_type: cross_attention
+      head_type: independent
+      use_cgct: false
+    - name: csg_only
+      fusion_type: csg
+      head_type: independent
+      use_cgct: false
+    - name: cusp_only
+      fusion_type: cross_attention
+      head_type: cusp_cascade
+      use_cgct: false
+    - name: csg_cusp
+      fusion_type: csg
+      head_type: cusp_cascade
+      use_cgct: false
+    - name: full_system
+      fusion_type: csg
+      head_type: cusp_cascade
+      use_cgct: true
+
+# ------------------------------------------------------------------------------
+# Paths & logging
+# ------------------------------------------------------------------------------
+paths:
+  checkpoints_dir: checkpoints
+  results_dir: results
+  logs_dir: results/logs
+logging:
+  level: INFO
+  log_to_file: true
