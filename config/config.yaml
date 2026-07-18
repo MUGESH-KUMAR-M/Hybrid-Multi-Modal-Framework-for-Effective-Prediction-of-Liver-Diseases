@@ -56,6 +56,10 @@ data:
   num_nafld_features: 11
   # Primary dataset selection: nafld (paired multimodal) or cirrhosis (tabular-only)
   primary_dataset: nafld
+  # CirrMRI600+ — unlabeled pretraining corpus only (T2_2D, cirrhosis + healthy)
+  # No tabular features, no supervised labels, not a primary_dataset candidate.
+  cirrmri_pretrain_slices_per_patient: 3
+  cirrmri_raw_path: "data/raw/CirrMRI600+"
   # Tabular preprocessing
   impute_strategy: median
   normalize: standard      # standard | minmax

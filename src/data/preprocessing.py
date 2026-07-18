@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Set
+
+from PIL import Image
 
 import numpy as np
 import pandas as pd
@@ -428,17 +430,231 @@ def preprocess_nafld_paired() -> Dict:
     return report
 
 
+# --------------------------------------------------------------------------- #
+# 6. CirrMRI600+ — Unlabeled Pretraining Corpus (SimCLR only)
+# --------------------------------------------------------------------------- #
+def preprocess_cirrmri_unlabeled() -> Dict:
+    """
+    CirrMRI600+ — unlabeled image preprocessing for SimCLR pre-training.
+
+    Extracts representative 2D liver slices from CirrMRI600+ T2-weighted data
+    (cirrhosis patients from T2_2D PNGs + healthy subjects from T2 NIfTI).
+
+    These slices are used ONLY for unsupervised contrastive pre-training.
+    No tabular features, no multi-task labels, no staging-head integration.
+    CirrMRI600+'s Radiological Evaluation labels are deliberately ignored.
+    """
+    print("[CirrMRI600+ Unlabeled] preprocessing ...")
+    report: Dict = {"dataset": "CirrMRI600+_Unlabeled", "steps": []}
+
+    cirrmri_root = RAW_DIR / "CirrMRI600+"
+    if not cirrmri_root.exists():
+        msg = f"CirrMRI600+ not found at {cirrmri_root}"
+        print(f"[CirrMRI600+ Unlabeled] SKIPPED: {msg}")
+        return {"error": msg}
+
+    slices_per_patient = 3
+    output_dir = PROC_DIR / "cirrmri_unlabeled_slices"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear any previous run
+    for old_file in output_dir.glob("*.npy"):
+        old_file.unlink()
+
+    manifest: Dict = {
+        "cirrhosis": {},
+        "healthy": {},
+        "source_splits": {},
+    }
+    cirrhosis_count = 0
+
+    # ------------------------------------------------------------------
+    # 1. Cirrhosis T2_2D patients (PNG slices — no NIfTI processing)
+    # ------------------------------------------------------------------
+    t2_2d_root = cirrmri_root / "Cirrhosis_T2_2D" / "Cirrhosis_T2_2D"
+
+    for split in ["train", "test", "valid"]:
+        split_dir = t2_2d_root / split
+        if not split_dir.exists():
+            continue
+
+        for patient_dir in sorted(split_dir.iterdir()):
+            if not patient_dir.is_dir():
+                continue
+            patient_id = patient_dir.name
+            images_dir = patient_dir / "images"
+            masks_dir = patient_dir / "masks"
+
+            if not images_dir.exists():
+                continue
+
+            # Score each slice by liver mask cross-sectional area
+            slice_scores = []
+            for img_path in sorted(images_dir.glob("*.png")):
+                mask_path = masks_dir / img_path.name
+                if mask_path.exists():
+                    mask_arr = np.array(Image.open(mask_path).convert("L"))
+                    area = int((mask_arr > 0).sum())
+                else:
+                    area = 0
+                slice_scores.append((img_path, area))
+
+            # Select top-N slices by liver mask area
+            slice_scores.sort(key=lambda x: x[1], reverse=True)
+            selected = slice_scores[:slices_per_patient]
+
+            patient_slices = []
+            for idx, (img_path, _area) in enumerate(selected):
+                # Load grayscale, resize to 224x224, normalize [0,1]
+                img_pil = Image.open(img_path).convert("L")
+                img_pil = img_pil.resize((224, 224), Image.BILINEAR)
+                arr = np.array(img_pil, dtype=np.float32) / 255.0
+                # Shape: (1, 224, 224) — single channel for SimCLR
+                arr = arr[None, ...]
+
+                out_name = f"cirrmri_{patient_id}_{idx}.npy"
+                np.save(output_dir / out_name, arr)
+                patient_slices.append(out_name)
+                cirrhosis_count += 1
+
+            manifest["cirrhosis"][patient_id] = patient_slices
+            manifest["source_splits"][patient_id] = split
+
+    report["steps"].append(
+        f"Processed {cirrhosis_count} cirrhosis T2_2D slices from "
+        f"{len(manifest['cirrhosis'])} patients"
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Healthy T2 subjects (NIfTI volumes — extract axial slices)
+    # ------------------------------------------------------------------
+    healthy_t2_imgs = cirrmri_root / "Healthy_subjects" / "T2_W_Healthy" / "T2_images"
+    healthy_t2_masks = cirrmri_root / "Healthy_subjects" / "T2_W_Healthy" / "T2_masks"
+    healthy_count = 0
+
+    if healthy_t2_imgs.exists():
+        try:
+            import nibabel as nib
+        except ImportError:
+            nib = None
+            print(
+                "[CirrMRI600+ Unlabeled] WARNING: nibabel not installed — "
+                "skipping 55 healthy T2 subjects"
+            )
+            report["steps"].append("Skipped healthy subjects (nibabel not installed)")
+
+        if nib is not None:
+            for nii_path in sorted(healthy_t2_imgs.glob("*.nii.gz")):
+                # Subject ID: stem without .nii extension  (e.g. "1" from "1.nii.gz")
+                subject_id = nii_path.name.replace(".nii.gz", "")
+                mask_path = healthy_t2_masks / nii_path.name
+
+                try:
+                    vol = nib.load(str(nii_path)).get_fdata(dtype=np.float32)
+                    has_mask = mask_path.exists()
+                    if has_mask:
+                        mask_vol = nib.load(str(mask_path)).get_fdata(dtype=np.float32)
+                    else:
+                        mask_vol = None
+
+                    # Determine the slice axis (smallest spatial dim = through-plane)
+                    if vol.ndim < 3:
+                        continue
+                    n_slices = vol.shape[2]  # standard axial for abdominal MRI
+
+                    # Score each axial slice by liver mask area
+                    slice_scores = []
+                    for s in range(n_slices):
+                        if mask_vol is not None:
+                            area = int((mask_vol[:, :, s] > 0).sum())
+                        else:
+                            # No mask — use intensity variance as a proxy
+                            area = int(vol[:, :, s].var())
+                        slice_scores.append((s, area))
+
+                    slice_scores.sort(key=lambda x: x[1], reverse=True)
+                    selected = slice_scores[:slices_per_patient]
+
+                    subject_slices = []
+                    for idx, (s_idx, _area) in enumerate(selected):
+                        img_2d = vol[:, :, s_idx]
+                        # Per-slice min-max to [0, 1] (MRI intensities are arbitrary)
+                        vmin, vmax = float(img_2d.min()), float(img_2d.max())
+                        if vmax > vmin:
+                            img_2d = (img_2d - vmin) / (vmax - vmin)
+                        else:
+                            img_2d = np.zeros_like(img_2d)
+                        # Resize to 224x224 via PIL (consistent with PNG path)
+                        img_uint8 = (img_2d * 255).clip(0, 255).astype(np.uint8)
+                        img_pil = Image.fromarray(img_uint8, mode="L")
+                        img_pil = img_pil.resize((224, 224), Image.BILINEAR)
+                        arr = np.array(img_pil, dtype=np.float32) / 255.0
+                        arr = arr[None, ...]  # (1, 224, 224)
+
+                        out_name = f"cirrmri_healthy_{subject_id}_{idx}.npy"
+                        np.save(output_dir / out_name, arr)
+                        subject_slices.append(out_name)
+                        healthy_count += 1
+
+                    manifest["healthy"][subject_id] = subject_slices
+                except Exception as exc:
+                    print(
+                        f"[CirrMRI600+ Unlabeled] Error processing healthy "
+                        f"subject {subject_id}: {exc}"
+                    )
+
+    report["steps"].append(
+        f"Processed {healthy_count} healthy T2 NIfTI slices from "
+        f"{len(manifest['healthy'])} subjects"
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Write manifest (for provenance / leakage checks)
+    # ------------------------------------------------------------------
+    manifest["total_cirrhosis_slices"] = cirrhosis_count
+    manifest["total_healthy_slices"] = healthy_count
+    manifest["total_slices"] = cirrhosis_count + healthy_count
+    manifest["slices_per_patient"] = slices_per_patient
+
+    manifest_path = PROC_DIR / "cirrmri_unlabeled_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    report["steps"].append(f"Manifest saved to {manifest_path}")
+
+    total = cirrhosis_count + healthy_count
+    print(
+        f"[CirrMRI600+ Unlabeled] done. {total} total slices "
+        f"({cirrhosis_count} cirrhosis + {healthy_count} healthy)"
+    )
+    report["total_slices"] = total
+    report["files"] = [str(manifest_path)]
+    return report
+
+
+def _assert_no_patient_id_collision(nafld_ids: Set[str], cirrmri_ids: Set[str]) -> None:
+    """Hard-fail if NAFLD and CirrMRI600+ patient IDs overlap.
+
+    A silent collision would contaminate the unlabeled pretraining corpus
+    provenance without any visible symptom in training metrics.
+    """
+    overlap = nafld_ids & cirrmri_ids
+    if overlap:
+        raise RuntimeError(
+            f"Patient ID collision between NAFLD and CirrMRI600+: {overlap}. "
+            "This would corrupt the unlabeled pretraining corpus provenance. "
+            "Aborting."
+        )
+
+
 def _generate_unlabeled_slices() -> None:
     """
-    Copy processed NAFLD images to data/processed/unlabeled_slices/ as
-    slice_XXXX.npy for SimCLR pre-training (Phase 2).
+    Merge NAFLD processed images and CirrMRI600+ unlabeled slices into
+    a single ``data/processed/unlabeled_slices/`` directory for SimCLR
+    pre-training (Phase 2).
     """
-    src_dir = PROC_DIR / "nafld_images"
     dst_dir = PROC_DIR / "unlabeled_slices"
-    if not src_dir.exists():
-        return
     dst_dir.mkdir(parents=True, exist_ok=True)
 
+    # Clear any previous run
     existing = list(dst_dir.glob("slice_*.npy"))
     if len(existing) > 0:
         print(f"[Unlabeled Slices] {len(existing)} slices already exist, regenerating...")
@@ -446,22 +662,45 @@ def _generate_unlabeled_slices() -> None:
             f.unlink()
 
     idx = 0
-    for npy_file in sorted(src_dir.glob("*.npy")):
-        arr = np.load(npy_file)
-        out_path = dst_dir / f"slice_{idx:04d}.npy"
-        # Ensure shape is (C, H, W) with C=1 for SimCLR augment to expand to 3
-        if arr.ndim == 3 and arr.shape[0] == 3:
-            # Already (3, H, W) — take single channel for diversity in augmentation
-            np.save(out_path, arr[:1])
-        elif arr.ndim == 3 and arr.shape[0] == 1:
-            np.save(out_path, arr)
-        elif arr.ndim == 2:
-            np.save(out_path, arr[None, ...])
-        else:
-            np.save(out_path, arr)
-        idx += 1
+    nafld_count = 0
+    cirrmri_count = 0
 
-    print(f"[Unlabeled Slices] Generated {idx} slices in {dst_dir}")
+    # --- Source 1: NAFLD processed images ---
+    nafld_src = PROC_DIR / "nafld_images"
+    if nafld_src.exists():
+        for npy_file in sorted(nafld_src.glob("*.npy")):
+            arr = np.load(npy_file)
+            out_path = dst_dir / f"slice_{idx:04d}.npy"
+            # Ensure shape is (C, H, W) with C=1 for SimCLR augment to expand to 3
+            if arr.ndim == 3 and arr.shape[0] == 3:
+                np.save(out_path, arr[:1])
+            elif arr.ndim == 3 and arr.shape[0] == 1:
+                np.save(out_path, arr)
+            elif arr.ndim == 2:
+                np.save(out_path, arr[None, ...])
+            else:
+                np.save(out_path, arr)
+            idx += 1
+            nafld_count += 1
+
+    # --- Source 2: CirrMRI600+ unlabeled slices ---
+    cirrmri_src = PROC_DIR / "cirrmri_unlabeled_slices"
+    if cirrmri_src.exists():
+        for npy_file in sorted(cirrmri_src.glob("*.npy")):
+            arr = np.load(npy_file)
+            out_path = dst_dir / f"slice_{idx:04d}.npy"
+            # CirrMRI slices are already (1, 224, 224), copy directly
+            if arr.ndim == 2:
+                np.save(out_path, arr[None, ...])
+            else:
+                np.save(out_path, arr)
+            idx += 1
+            cirrmri_count += 1
+
+    print(
+        f"[Unlabeled Slices] Generated {idx} slices in {dst_dir} "
+        f"(NAFLD: {nafld_count}, CirrMRI600+: {cirrmri_count})"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -490,7 +729,45 @@ def preprocess_all() -> Dict:
         results["preprocess_nafld_paired"] = {"error": str(exc)}
         print(f"[preprocess_nafld_paired] FAILED: {exc}")
 
-    # Generate unlabeled slices for SimCLR pre-training
+    # CirrMRI600+ unlabeled pretraining corpus (T2_2D slices for SimCLR)
+    try:
+        results["preprocess_cirrmri_unlabeled"] = preprocess_cirrmri_unlabeled()
+    except Exception as exc:
+        results["preprocess_cirrmri_unlabeled"] = {"error": str(exc)}
+        print(f"[preprocess_cirrmri_unlabeled] FAILED: {exc}")
+
+    # --- Patient ID collision assertion ---
+    # NAFLD IDs are strings like "id1", "id2"; CirrMRI IDs are numeric strings
+    # like "10", "100". They should never overlap, but assert rather than assume.
+    try:
+        nafld_ids: Set[str] = set()
+        nafld_csv = PROC_DIR / "nafld_paired_train.csv"
+        if nafld_csv.exists():
+            ndf = pd.read_csv(nafld_csv)
+            if "image_path" in ndf.columns:
+                for p in ndf["image_path"].dropna():
+                    # Extract patient ID from path like "...nafld_images/id5_processed.npy"
+                    stem = Path(str(p)).stem  # "id5_processed"
+                    pid = stem.replace("_processed", "")
+                    nafld_ids.add(pid)
+
+        cirrmri_ids: Set[str] = set()
+        manifest_path = PROC_DIR / "cirrmri_unlabeled_manifest.json"
+        if manifest_path.exists():
+            mf = json.loads(manifest_path.read_text(encoding="utf-8"))
+            cirrmri_ids.update(f"cirrmri_{k}" for k in mf.get("cirrhosis", {}))
+            cirrmri_ids.update(f"cirrmri_healthy_{k}" for k in mf.get("healthy", {}))
+
+        if nafld_ids and cirrmri_ids:
+            _assert_no_patient_id_collision(nafld_ids, cirrmri_ids)
+            print(f"[ID Collision Check] OK — {len(nafld_ids)} NAFLD vs {len(cirrmri_ids)} CirrMRI IDs, no overlap")
+    except RuntimeError:
+        raise  # Re-raise collision errors — these are fatal
+    except Exception as exc:
+        print(f"[ID Collision Check] WARNING: could not verify — {exc}")
+
+    # Generate merged unlabeled slices for SimCLR pre-training
+    # (must run AFTER both NAFLD and CirrMRI preprocessing)
     try:
         _generate_unlabeled_slices()
     except Exception as exc:

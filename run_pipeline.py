@@ -94,6 +94,11 @@ def run_pipeline(
             "preprocessing_report.json"
         ]
         
+        # CirrMRI600+ outputs (pretraining-only — no cirrmri_paired_*.csv expected)
+        cirrmri_raw = Path("data/raw/CirrMRI600+")
+        if cirrmri_raw.exists():
+            expected_files.append("cirrmri_unlabeled_manifest.json")
+        
         for expected in expected_files:
             file_path = proc_dir / expected
             if not file_path.exists():
